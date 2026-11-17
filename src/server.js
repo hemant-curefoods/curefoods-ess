@@ -37,10 +37,19 @@ app.use(helmet({
 
 // ---- rate limits ----
 // Sign-in actions: per IP. (Per-employee lockout after 5 wrong tries is enforced separately.)
+const isAuth = req => api.AUTH_ACTIONS.has(req.body && req.body.action);
 const authLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000, limit: 60, standardHeaders: 'draft-7', legacyHeaders: false,
+  windowMs: 5 * 60 * 1000, limit: config.authRateLimit, standardHeaders: 'draft-7', legacyHeaders: false,
   message: { ok: false, error: 'Too many attempts from this network. Please wait a few minutes.' },
-  skip: req => !api.AUTH_ACTIONS.has(req.body && req.body.action),
+  skip: req => !isAuth(req),
+});
+// Counts only failed sign-in steps (wrong PIN/DOB, unknown ID) per IP.
+const authFailLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, limit: config.authFailLimit, standardHeaders: false, legacyHeaders: false,
+  message: { ok: false, error: 'Too many failed sign-in attempts from this network. Please try again in an hour or contact HR.' },
+  skip: req => !isAuth(req),
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (req, res) => !res.locals.authFailed,
 });
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000, limit: 300, standardHeaders: 'draft-7', legacyHeaders: false,
@@ -48,8 +57,10 @@ const apiLimiter = rateLimit({
 });
 
 // 5 attachments x 2 MB, base64-encoded ≈ 14 MB
-app.post('/api', express.json({ limit: '15mb' }), apiLimiter, authLimiter, api.handle);
+app.post('/api', express.json({ limit: '15mb' }), apiLimiter, authLimiter, authFailLimiter, api.handle);
 app.get('/api/file/:id', apiLimiter, api.file);
+// Apps Script PortalSync pushes offer letters / payslips here (HMAC-signed, see src/api/ingest.js)
+app.use('/ingest', rateLimit({ windowMs: 60 * 1000, limit: 600, standardHeaders: 'draft-7', legacyHeaders: false }), require('./api/ingest').router);
 app.get('/healthz', async (req, res) => {
   try { await pool.query('SELECT 1'); res.json({ ok: true }); } catch (e) { res.status(503).json({ ok: false }); }
 });

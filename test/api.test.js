@@ -160,10 +160,11 @@ test('change PIN', async () => {
   assert.ok((await api({ action: 'loginPin', empCode: 'CFD90001', pin: '9174' })).ok);
 });
 
-test('documents report not-connected cleanly', async () => {
-  const r = await api({ action: 'myOffers', session: S.emp });
-  assert.equal(r.ok, false);
-  assert.match(r.error, /aren’t connected/);
+test('documents: empty lists before anything is synced, bad ids refused', async () => {
+  const r = await api({ action: 'myPayslips', session: S.l1 });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.items, []);
+  assert.equal((await api({ action: 'offerPdf', session: S.l1, id: 'd999999' })).ok, false);
 });
 
 test('no session / bad action', async () => {

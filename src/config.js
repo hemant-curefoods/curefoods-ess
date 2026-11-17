@@ -34,6 +34,10 @@ const config = {
   hrHeadCodes: list(process.env.HR_HEAD_CODES),
 
   maxFails: Number(process.env.MAX_FAILS || 5),
+  // per IP: all sign-in requests per 5 min (generous: shared store Wi-Fi), and FAILED ones per hour (strict:
+  // stops someone trying one common PIN across many Employee IDs)
+  authRateLimit: Number(process.env.AUTH_RATE_LIMIT || 300),
+  authFailLimit: Number(process.env.AUTH_FAIL_LIMIT || 30),
   lockMinutes: Number(process.env.LOCK_MINUTES || 30),
   sessionIdleMinutes: Number(process.env.SESSION_IDLE_MINUTES || 60),
   sessionMaxHours: Number(process.env.SESSION_MAX_HOURS || 12),
@@ -44,6 +48,12 @@ const config = {
   uploadDir: path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, '..', 'data', 'uploads')),
   maxFiles: 5,
   maxFileBytes: 2 * 1024 * 1024,
+
+  // where offer letters / payslips come from: 'db' (pushed by Apps Script PortalSync) or 'google' (service account)
+  docsSource: (process.env.DOCS_SOURCE || 'db').toLowerCase(),
+  docsDir: path.resolve(process.env.DOCS_DIR || path.join(__dirname, '..', 'data', 'documents')),
+  // shared secret used by the Apps Script PortalSync job to sign pushes (32+ chars)
+  ingestSecret: process.env.INGEST_SECRET || '',
 
   google: {
     credentialsFile: process.env.GOOGLE_APPLICATION_CREDENTIALS || '',
@@ -62,6 +72,7 @@ config.validate = function validate() {
   if (!config.db.user) missing.push('PGUSER');
   if (!config.pinPepper || config.pinPepper.length < 32) missing.push('PIN_PEPPER (32+ random chars)');
   if (!config.hrHeadCodes.length) missing.push('HR_HEAD_CODES');
+  if (config.ingestSecret && config.ingestSecret.length < 32) missing.push('INGEST_SECRET (32+ random chars, or leave blank)');
   if (missing.length) {
     console.error('Missing/invalid settings in .env: ' + missing.join(', '));
     process.exit(1);

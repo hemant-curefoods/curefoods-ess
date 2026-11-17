@@ -9,7 +9,8 @@ Node.js (Express) + PostgreSQL. Serves the ESS web app and its API from one proc
 ```
 public/            the web app (HTML/CSS/JS, unchanged look from the prototype)
 src/server.js      Express server, security headers, rate limits
-src/api/           account (sign-in, PINs, view-as) · tickets · documents (Google Sheets/Drive)
+src/api/           account (sign-in, PINs, view-as) · tickets · documents · ingest (signed pushes from PortalSync)
+bridge/            PortalSync.gs — Apps Script that copies offer letters + payslips into the portal
 src/employees.js   Employee Master mapping, role rules, ticket routing
 sql/               000 = DB user setup (run once as admin) · 001 = schema "ess"
 scripts/           migrate · import-employees (Excel/CSV) · make-template
@@ -22,7 +23,7 @@ test/              API + unit tests
 | Topic | Rule |
 |---|---|
 | Data location | Everything lives in its own **`ess` schema**. The app logs in as `ess_app`, which can only touch that schema. |
-| PINs | Peppered HMAC + bcrypt. 5 wrong PIN/DOB tries → ID locked 30 min. Weak PINs (1111, 1234, birth year/day) refused. Only HR can reset; reset signs the employee out everywhere. |
+| PINs | Peppered HMAC + bcrypt. 5 wrong PIN/DOB tries → ID locked 30 min; 30 failed sign-in steps from one IP → that IP blocked for an hour (stops trying one PIN across many IDs). Weak PINs (1111, 1234, birth year/day) refused. Only HR can reset; reset signs the employee out everywhere. |
 | Sessions | Random token, stored hashed. 60 min idle / 12 h max. View-as sessions: 30 min, read-only (enforced on the server). |
 | Roles | From the Employee Master on every request: **HR Head** = `HR_HEAD_CODES`; **HR** = appears as someone's *HR Manager Code*; **L1** = appears as someone's *L1 Manager Code*; **Admin** flag = `ADMIN_CODES`. |
 | Ticket routing | POSH → HR Head. Otherwise → the employee's *HR Manager Code* (if that person is active HR), else HR Head. |
@@ -46,10 +47,10 @@ nginx -v || apt-get install -y nginx
 ### 2. App user + code
 ```bash
 adduser --disabled-password --gecos "" ess
-mkdir -p /opt/curefoods-ess /var/lib/curefoods-ess/uploads /var/log/curefoods-ess
+mkdir -p /opt/curefoods-ess /var/lib/curefoods-ess/uploads /var/lib/curefoods-ess/documents /var/log/curefoods-ess
 git clone <REPO_URL> /opt/curefoods-ess
 chown -R ess:ess /opt/curefoods-ess /var/lib/curefoods-ess /var/log/curefoods-ess
-chmod 750 /var/lib/curefoods-ess/uploads
+chmod 750 /var/lib/curefoods-ess/uploads /var/lib/curefoods-ess/documents
 cd /opt/curefoods-ess && sudo -u ess npm ci --omit=dev
 ```
 
@@ -66,7 +67,7 @@ sudo -u ess cp .env.example .env && chmod 600 .env
 node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"   # -> PIN_PEPPER
 sudo -u ess nano .env
 ```
-Fill in: `PGDATABASE=<dbname>`, `PGPASSWORD=<APP_PW>`, `PIN_PEPPER`, `HR_HEAD_CODES`, `ADMIN_CODES`.
+Fill in: `PGDATABASE=<dbname>`, `PGPASSWORD=<APP_PW>`, `PIN_PEPPER`, `HR_HEAD_CODES`, `ADMIN_CODES`, `INGEST_SECRET` (step 8).
 Back up `.env` somewhere safe — losing `PIN_PEPPER` means every employee must re-set their PIN.
 
 ```bash
@@ -103,19 +104,51 @@ Open `http://103.172.150.31:8080`.
 
 > ⚠️ **Plain HTTP sends PINs unencrypted.** Use the IP-only setup for a small internal pilot only. Before employees use it, point a domain at the server and add HTTPS (step 9).
 
-### 8. Offer letters + payslips (Google Sheets + Drive)
-1. Google Cloud Console → create a project → enable **Google Sheets API** and **Google Drive API**.
-2. IAM → Service accounts → create one (no roles needed) → Keys → *Add key → JSON*. Copy the file to `/opt/curefoods-ess/google-service-account.json`, `chown ess:ess`, `chmod 600`.
-3. **Share** these with the service account's e-mail as **Viewer**: the *Offer Letter Automation* spreadsheet, each entity's *NAPS Payroll* spreadsheet, and the Drive folders holding the offer and payslip PDFs. (If the files are on a Shared Drive, add the service account as a Viewer member of that drive.)
-4. In `.env`:
-   ```
-   GOOGLE_APPLICATION_CREDENTIALS=/opt/curefoods-ess/google-service-account.json
-   OFFER_SHEET_ID=<id from the offer spreadsheet URL>
-   NAPS_SHEET_IDS=<entity1 payroll sheet id>,<entity2 ...>
-   ```
-5. `sudo -u ess pm2 reload curefoods-ess`
+### 8. Offer letters + payslips (PortalSync)
+Your existing Apps Scripts keep generating letters and payslips exactly as today. A small extra script,
+**`bridge/PortalSync.gs`**, copies them into the portal every 15 minutes:
 
-Matching rules (same as the prototype): an offer is shown when its *Phone Number* matches the employee's mobile in the master **and** its *Date of Birth* matches (unless the offer's DOB is blank or an obvious placeholder). Payslips are matched on *Employee ID* with *Status = Generated*.
+```
+Offer Letter tool ──► "Offer Log" tab (Status = Sent, Offer URL)        ┐
+NAPS payslip tool ──► each entity's "Payroll" tab (Status = Generated,  ├─► PortalSync.gs ──(signed HTTPS)──► /ingest ──► ess.offer_letters / ess.payslips + PDFs on disk
+                      PDF File ID)                                       ┘
+```
+- It asks the portal what it already has and sends only **new or regenerated** documents. The first runs back-fill history (a few hundred per run).
+- It **never edits** your sheets. It needs only *view* access to the sheets and the PDF folders.
+- Requests are signed with HMAC-SHA256 + a timestamp (`INGEST_SECRET`). Unsigned, stale or tampered requests are rejected; only real PDFs are accepted.
+- Employees then open documents straight from the portal, with no Google calls at view time (fast on payday, not tied to Google quotas).
+
+> Needs the **domain + HTTPS** (step 9) first: payslips carry salary data, and Google must be able to reach `https://<domain>/ingest`. The script refuses `http://` URLs.
+
+**Portal side**
+```bash
+node -e "console.log(require('crypto').randomBytes(36).toString('base64url'))"   # -> INGEST_SECRET
+mkdir -p /var/lib/curefoods-ess/documents && chown ess:ess /var/lib/curefoods-ess/documents && chmod 750 /var/lib/curefoods-ess/documents
+# .env:  DOCS_SOURCE=db   DOCS_DIR=/var/lib/curefoods-ess/documents   INGEST_SECRET=<value>
+sudo -u ess pm2 reload curefoods-ess
+```
+
+**Google side** (≈10 min, from an HR/ops Google account — ideally a shared one, not a personal one — that can open the Offer Letter spreadsheet, every entity's Payroll spreadsheet and the PDF folders)
+1. Go to script.google.com → **New project**, name it *ESS PortalSync*, and paste in `bridge/PortalSync.gs`.
+2. Open **Project Settings → Script Properties** and add:
+
+   | Property | Value |
+   |---|---|
+   | `PORTAL_URL` | `https://ess.curefoods.in` |
+   | `PORTAL_SECRET` | same value as `INGEST_SECRET` |
+   | `OFFER_SHEET_ID` | id from the Offer Letter spreadsheet URL (`/d/<id>/edit`) |
+   | `NAPS_SHEET_IDS` | the Payroll spreadsheet ids, comma-separated (one per entity) |
+3. Run **`testPortalConnection`** and approve the permissions. The log should show the portal's counts and each sheet's row count.
+4. Run **`setupPortalSync`**. It starts the first sync now and schedules one every 15 minutes.
+5. Check progress: Script Properties → `LAST_SYNC` (e.g. `offers+212 payslips+340 pending 1200 (next run)`).
+
+Notes
+- **Regenerated payslip** (re-run after a correction): the new PDF replaces the old one in the portal at the next sync.
+- **Letter issued in error:** in the script editor run `removeFromPortal('offer', '<Drive file id>')` (or `'payslip'`).
+- **Matching:** an offer shows for an employee when its *Phone Number* matches their mobile in the Employee Master **and** its *Date of Birth* matches (unless the offer's DOB is blank or a placeholder). Payslips match on *Employee ID*.
+- **Column renamed in a sheet?** Update the `COLS` block at the top of `PortalSync.gs`.
+
+**Alternative: read live from Google with a service account.** Set `DOCS_SOURCE=google`, create a service account (Google Cloud Console → enable the Sheets and Drive APIs → service account → JSON key), share the sheets and PDF folders with its e-mail as Viewer, then set `GOOGLE_APPLICATION_CREDENTIALS`, `OFFER_SHEET_ID` and `NAPS_SHEET_IDS`.
 
 ### 9. Domain + HTTPS (later)
 ```bash
@@ -135,7 +168,7 @@ certbot --nginx -d ess.curefoods.in
 | Update code | `cd /opt/curefoods-ess && sudo -u ess git pull && sudo -u ess npm ci --omit=dev && sudo -u ess npm run migrate && sudo -u ess pm2 reload curefoods-ess` |
 | Logs | `sudo -u ess pm2 logs curefoods-ess` |
 | Refresh Employee Master | step 5 |
-| Backup | `pg_dump -h localhost -U admin -d <dbname> -n ess -Fc > ess_$(date +%F).dump` + copy `/var/lib/curefoods-ess/uploads` |
+| Backup | `pg_dump -h localhost -U admin -d <dbname> -n ess -Fc > ess_$(date +%F).dump` + copy `/var/lib/curefoods-ess/uploads` (documents can be re-synced from Google) |
 | Who reset whose PIN? | `SELECT * FROM ess.audit_log WHERE action='pin_reset' ORDER BY at DESC;` |
 
 ## Server hardening checklist
@@ -150,5 +183,6 @@ cp .env.example .env     # point at a local Postgres
 npm install && npm run migrate
 npm run import:employees -- templates/employee_master_template.xlsx --apply
 npm run dev              # http://127.0.0.1:3100
-npm test                 # needs the server running + the prototype's sample employees loaded
+npm test                 # needs the server running (AUTH_FAIL_LIMIT=1000) + the prototype's sample employees;
+                         # set INGEST_SECRET in the shell to include the PortalSync simulation
 ```

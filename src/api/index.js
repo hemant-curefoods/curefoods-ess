@@ -48,6 +48,7 @@ async function handle(req, res) {
       if (def.level === 'admin' && !ctx.isAdmin) return res.status(403).json({ ok: false, error: 'Admin access only.' });
     }
     const out = await def.fn(body, req, ctx);
+    if (AUTH_ACTIONS.has(body.action) && out && out.ok === false) res.locals.authFailed = true;
     res.json(out);
   } catch (e) {
     console.error('[api]', body.action, e);
